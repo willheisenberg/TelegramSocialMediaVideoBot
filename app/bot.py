@@ -51,7 +51,6 @@ async def handle_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     match = URL_PATTERN.search(message.text)
     if not match:
-        await message.reply_text("Ich habe keinen gueltigen Link gefunden.")
         return
 
     url = match.group(0)
