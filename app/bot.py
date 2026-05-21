@@ -92,7 +92,7 @@ async def handle_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 caption = ""
                 if idx == 0:
                     caption_parts = [item.title]
-                    if isinstance(item, DownloadedVideo) and item.uploader:
+                    if item.uploader:
                         caption_parts.append(f"Quelle: {item.uploader}")
                     caption = "\n".join(caption_parts)[:1024]
                     
@@ -109,15 +109,19 @@ async def handle_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     f.close()
         elif isinstance(media, DownloadedImage):
             with media.file_path.open("rb") as file_handle:
+                caption_parts = [media.title]
+                if media.uploader:
+                    caption_parts.append(f"Quelle: {media.uploader}")
+                caption = "\n".join(caption_parts)[:1024]
                 if media.is_gif:
                     await message.reply_animation(
                         animation=file_handle,
-                        caption=media.title[:1024],
+                        caption=caption,
                     )
                 else:
                     await message.reply_photo(
                         photo=file_handle,
-                        caption=media.title[:1024],
+                        caption=caption,
                     )
             await status_message.edit_text("Fertig.")
         else:

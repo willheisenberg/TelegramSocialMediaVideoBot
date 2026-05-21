@@ -30,6 +30,7 @@ class DownloadedImage:
     title: str
     source_url: str
     is_gif: bool
+    uploader: str | None = None
 
 
 class VideoDownloader:
@@ -450,7 +451,8 @@ class VideoDownloader:
                 file_path=persistent_path,
                 title=title,
                 source_url=url,
-                is_gif=is_gif
+                is_gif=is_gif,
+                uploader=selected_item.get("fullname") or selected_item.get("username")
             )
 
     def _download_via_gallery_dl(self, url: str, username: str | None = None, password: str | None = None) -> DownloadedVideo | DownloadedImage | list[DownloadedVideo | DownloadedImage]:
