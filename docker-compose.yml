@@ -8,3 +8,4 @@ services:
       - .env
     volumes:
       - ./downloads:/tmp/telegram-social-bot
+      - ./cookies.txt:/app/cookies.txt

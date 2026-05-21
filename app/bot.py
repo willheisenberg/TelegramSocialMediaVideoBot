@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
-from telegram import Update
+from telegram import Update, InputMediaPhoto, InputMediaVideo
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from app.config import Settings
-from app.downloader import DownloaderError, VideoDownloader
+from app.downloader import DownloaderError, VideoDownloader, DownloadedImage, DownloadedVideo
 
 LOGGER = logging.getLogger(__name__)
 URL_PATTERN = re.compile(r"https?://\S+")
@@ -18,6 +19,17 @@ def build_application(settings: Settings) -> Application:
     downloader = VideoDownloader(
         download_dir=settings.download_dir,
         max_download_size_bytes=settings.max_download_size_bytes,
+        cookies_file_path=settings.cookies_file_path,
+        extractor_username=settings.extractor_username,
+        extractor_password=settings.extractor_password,
+        instagram_username=settings.instagram_username,
+        instagram_password=settings.instagram_password,
+        youtube_username=settings.youtube_username,
+        youtube_password=settings.youtube_password,
+        twitter_username=settings.twitter_username,
+        twitter_password=settings.twitter_password,
+        tiktok_username=settings.tiktok_username,
+        tiktok_password=settings.tiktok_password,
     )
 
     application = Application.builder().token(settings.telegram_bot_token).build()
@@ -33,14 +45,14 @@ def build_application(settings: Settings) -> Application:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "Schick mir einen Videolink. Ich lade das Video herunter und sende es dir direkt im Chat zurueck."
+        "Schick mir einen Video- oder Bildlink. Ich lade das Medium herunter und sende es dir direkt im Chat zurueck."
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "Unterstuetzt werden Links von Plattformen, die `yt-dlp` verarbeiten kann. "
-        "Wenn das Video zu gross ist oder die Plattform blockiert, melde ich das direkt."
+        "Unterstuetzt werden Direktlinks zu Bildern (JPEG, PNG, WEBP, GIF) sowie Video-Links von Plattformen, "
+        "die `yt-dlp` verarbeiten kann. Wenn die Datei zu gross ist oder die Plattform blockiert, melde ich das direkt."
     )
 
 
@@ -57,28 +69,80 @@ async def handle_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     downloader: VideoDownloader = context.application.bot_data["downloader"]
 
     status_message = await message.reply_text("Download gestartet...")
-    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+    # Determine chat action based on whether it is an image or video
+    is_image, is_gif = await asyncio.to_thread(downloader._check_if_image, url)
+    if is_image:
+        action = ChatAction.UPLOAD_VIDEO if is_gif else ChatAction.UPLOAD_PHOTO
+    else:
+        action = ChatAction.UPLOAD_VIDEO
+
+    await context.bot.send_chat_action(chat_id=message.chat_id, action=action)
 
     try:
-        video = await downloader.download(url)
-        caption_parts = [video.title]
-        if video.uploader:
-            caption_parts.append(f"Quelle: {video.uploader}")
-        caption = "\n".join(caption_parts)
-
-        with video.file_path.open("rb") as file_handle:
-            await message.reply_video(
-                video=file_handle,
-                caption=caption[:1024],
-                supports_streaming=True,
-            )
-        await status_message.edit_text("Fertig.")
+        media = await downloader.download(url)
+        if isinstance(media, list):
+            # Send all downloaded items as a native Telegram Media Group (Album)
+            files = []
+            media_group = []
+            for idx, item in enumerate(media):
+                f = item.file_path.open("rb")
+                files.append(f)
+                
+                caption = ""
+                if idx == 0:
+                    caption_parts = [item.title]
+                    if isinstance(item, DownloadedVideo) and item.uploader:
+                        caption_parts.append(f"Quelle: {item.uploader}")
+                    caption = "\n".join(caption_parts)[:1024]
+                    
+                if isinstance(item, DownloadedImage):
+                    media_group.append(InputMediaPhoto(media=f, caption=caption))
+                elif isinstance(item, DownloadedVideo):
+                    media_group.append(InputMediaVideo(media=f, caption=caption))
+            
+            try:
+                await message.reply_media_group(media=media_group)
+                await status_message.edit_text("Fertig.")
+            finally:
+                for f in files:
+                    f.close()
+        elif isinstance(media, DownloadedImage):
+            with media.file_path.open("rb") as file_handle:
+                if media.is_gif:
+                    await message.reply_animation(
+                        animation=file_handle,
+                        caption=media.title[:1024],
+                    )
+                else:
+                    await message.reply_photo(
+                        photo=file_handle,
+                        caption=media.title[:1024],
+                    )
+            await status_message.edit_text("Fertig.")
+        else:
+            caption_parts = [media.title]
+            if media.uploader:
+                caption_parts.append(f"Quelle: {media.uploader}")
+            caption = "\n".join(caption_parts)
+ 
+            with media.file_path.open("rb") as file_handle:
+                await message.reply_video(
+                    video=file_handle,
+                    caption=caption[:1024],
+                    supports_streaming=True,
+                )
+            await status_message.edit_text("Fertig.")
     except DownloaderError as exc:
         LOGGER.warning("Downloader error for %s: %s", url, exc)
         await status_message.edit_text(f"Download fehlgeschlagen: {exc}")
     finally:
-        if "video" in locals():
-            downloader.cleanup(video.file_path)
+        if "media" in locals():
+            if isinstance(media, list):
+                for item in media:
+                    downloader.cleanup(item.file_path)
+            else:
+                downloader.cleanup(media.file_path)
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
