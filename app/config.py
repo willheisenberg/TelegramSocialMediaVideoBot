@@ -22,6 +22,13 @@ class Settings:
     tiktok_username: str | None = None
     tiktok_password: str | None = None
 
+    # HTTP client timeouts
+    http_connect_timeout: float = 20.0
+    http_read_timeout: float = 20.0
+    http_write_timeout: float = 20.0
+    http_pool_timeout: float = 20.0
+    http_media_write_timeout: float = 180.0
+
     @property
     def max_download_size_bytes(self) -> int:
         return self.max_download_size_mb * 1024 * 1024
@@ -56,6 +63,12 @@ def load_settings() -> Settings:
     tiktok_username = os.getenv("TIKTOK_USERNAME", "").strip() or None
     tiktok_password = os.getenv("TIKTOK_PASSWORD", "").strip() or None
 
+    http_connect_timeout = float(os.getenv("HTTP_CONNECT_TIMEOUT", "20.0"))
+    http_read_timeout = float(os.getenv("HTTP_READ_TIMEOUT", "20.0"))
+    http_write_timeout = float(os.getenv("HTTP_WRITE_TIMEOUT", "20.0"))
+    http_pool_timeout = float(os.getenv("HTTP_POOL_TIMEOUT", "20.0"))
+    http_media_write_timeout = float(os.getenv("HTTP_MEDIA_WRITE_TIMEOUT", "180.0"))
+
     return Settings(
         telegram_bot_token=token,
         max_download_size_mb=max_download_size_mb,
@@ -71,4 +84,9 @@ def load_settings() -> Settings:
         twitter_password=twitter_password,
         tiktok_username=tiktok_username,
         tiktok_password=tiktok_password,
+        http_connect_timeout=http_connect_timeout,
+        http_read_timeout=http_read_timeout,
+        http_write_timeout=http_write_timeout,
+        http_pool_timeout=http_pool_timeout,
+        http_media_write_timeout=http_media_write_timeout,
     )

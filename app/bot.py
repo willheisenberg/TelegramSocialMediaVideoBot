@@ -32,7 +32,16 @@ def build_application(settings: Settings) -> Application:
         tiktok_password=settings.tiktok_password,
     )
 
-    application = Application.builder().token(settings.telegram_bot_token).build()
+    application = (
+        Application.builder()
+        .token(settings.telegram_bot_token)
+        .connect_timeout(settings.http_connect_timeout)
+        .read_timeout(settings.http_read_timeout)
+        .write_timeout(settings.http_write_timeout)
+        .pool_timeout(settings.http_pool_timeout)
+        .media_write_timeout(settings.http_media_write_timeout)
+        .build()
+    )
     application.bot_data["downloader"] = downloader
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
