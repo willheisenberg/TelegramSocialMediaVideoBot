@@ -5,3 +5,4 @@ __pycache__/
 downloads/
 cookies.txt
 deploy.sh
+.venv/
