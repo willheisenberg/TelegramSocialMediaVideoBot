@@ -186,9 +186,43 @@ class VideoDownloader:
     def _download_sync(self, url: str) -> DownloadedVideo | DownloadedImage:
         with tempfile.TemporaryDirectory(dir=self.download_dir) as tmp_dir:
             output_template = os.path.join(tmp_dir, "%(title).80s-%(id)s.%(ext)s")
+            # Formatauswahl mit zwei Zielen, in Prioritaetsreihenfolge:
+            #   1. Groesse <= Telegram-Upload-Limit (sonst scheitert der Upload),
+            #   2. immer eine Tonspur (kein stummes Video).
+            # Deshalb zuerst Merge-Zweige mit Audio (m4a bevorzugt fuer maximale
+            # Player-Kompatibilitaet, sonst beliebiges Audio), dann kombinierte
+            # Formate, die explizit eine Tonspur haben (acodec!=none). Erst als
+            # allerletzter Notnagel steht ein nacktes "b". Der filesize-Filter
+            # greift nur bei bekannter Groesse (exakt oder geschaetzt), daher je
+            # eine Variante fuer filesize und filesize_approx. Was das Limit doch
+            # ueberschreitet, faengt der Groessen-Gate nach dem Download ab.
+            size_mb = max(1, self.max_download_size_bytes // (1024 * 1024))
+            format_selection = "/".join(
+                [
+                    # unter Limit, Video+Audio (m4a bevorzugt)
+                    f"bv*[ext=mp4][filesize<={size_mb}M]+ba[ext=m4a]",
+                    f"bv*[ext=mp4][filesize_approx<={size_mb}M]+ba[ext=m4a]",
+                    f"bv*[ext=mp4][filesize<={size_mb}M]+ba",
+                    f"bv*[ext=mp4][filesize_approx<={size_mb}M]+ba",
+                    # unter Limit, kombiniertes Format mit garantierter Tonspur
+                    f"b[ext=mp4][filesize<={size_mb}M][acodec!=none]",
+                    f"b[filesize<={size_mb}M][acodec!=none]",
+                    f"b[filesize_approx<={size_mb}M][acodec!=none]",
+                    # ohne Groessengrenze, aber weiterhin mit Ton
+                    "bv*[ext=mp4]+ba[ext=m4a]",
+                    "bv*[ext=mp4]+ba",
+                    "b[ext=mp4][acodec!=none]",
+                    "b[acodec!=none]",
+                    # absoluter Notnagel (evtl. stumm, aber besser als gar nichts)
+                    "b",
+                ]
+            )
             ydl_opts: dict[str, Any] = {
                 "outtmpl": output_template,
-                "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
+                "format": format_selection,
+                # Innerhalb der obigen Auswahl h264 bevorzugen (auf allen Telegram-
+                # Clients abspielbar); h265/HEVC nur, wenn kein h264 verfuegbar ist.
+                "format_sort": ["vcodec:h264"],
                 "merge_output_format": "mp4",
                 "noplaylist": True,
                 "quiet": True,
