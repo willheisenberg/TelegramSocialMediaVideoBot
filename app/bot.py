@@ -6,6 +6,7 @@ import re
 
 from telegram import Update, InputMediaPhoto, InputMediaVideo
 from telegram.constants import ChatAction
+from telegram.error import NetworkError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from app.config import Settings
@@ -13,6 +14,32 @@ from app.downloader import DownloaderError, VideoDownloader, DownloadedImage, Do
 
 LOGGER = logging.getLogger(__name__)
 URL_PATTERN = re.compile(r"https?://\S+")
+
+UPLOAD_MAX_ATTEMPTS = 3
+UPLOAD_RETRY_BASE_DELAY = 2.0
+
+
+async def _upload_with_retry(send_coro_factory):
+    """Fuehrt einen Upload aus und wiederholt ihn bei transienten Netzwerkfehlern.
+
+    ``send_coro_factory`` muss bei jedem Aufruf eine frische Coroutine liefern und
+    die Datei-Handles selbst neu oeffnen, damit der Lesezeiger nach einem
+    Fehlversuch wieder am Dateianfang steht.
+    """
+    for attempt in range(1, UPLOAD_MAX_ATTEMPTS + 1):
+        try:
+            await send_coro_factory()
+            return
+        except NetworkError as exc:
+            if attempt == UPLOAD_MAX_ATTEMPTS:
+                raise
+            LOGGER.warning(
+                "Upload-Versuch %d/%d fehlgeschlagen (%s), neuer Versuch...",
+                attempt,
+                UPLOAD_MAX_ATTEMPTS,
+                exc,
+            )
+            await asyncio.sleep(UPLOAD_RETRY_BASE_DELAY * attempt)
 
 
 def build_application(settings: Settings) -> Application:
@@ -91,64 +118,82 @@ async def handle_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     try:
         media = await downloader.download(url)
         if isinstance(media, list):
-            # Send all downloaded items as a native Telegram Media Group (Album)
-            files = []
-            media_group = []
-            for idx, item in enumerate(media):
-                f = item.file_path.open("rb")
-                files.append(f)
-                
-                caption = ""
-                if idx == 0:
-                    caption_parts = [item.title]
-                    if item.uploader:
-                        caption_parts.append(f"Quelle: {item.uploader}")
-                    caption = "\n".join(caption_parts)[:1024]
-                    
-                if isinstance(item, DownloadedImage):
-                    media_group.append(InputMediaPhoto(media=f, caption=caption))
-                elif isinstance(item, DownloadedVideo):
-                    media_group.append(InputMediaVideo(media=f, caption=caption))
-            
-            try:
-                await message.reply_media_group(media=media_group)
-                await status_message.edit_text("Fertig.")
-            finally:
-                for f in files:
-                    f.close()
+            # Send all downloaded items as a native Telegram Media Group (Album).
+            # Die Datei-Handles werden bei jedem Versuch neu geoeffnet, damit ein
+            # Retry nach einem Netzwerkfehler die Dateien von vorne liest.
+            async def _send_media_group() -> None:
+                files = []
+                media_group = []
+                try:
+                    for idx, item in enumerate(media):
+                        f = item.file_path.open("rb")
+                        files.append(f)
+
+                        caption = ""
+                        if idx == 0:
+                            caption_parts = [item.title]
+                            if item.uploader:
+                                caption_parts.append(f"Quelle: {item.uploader}")
+                            caption = "\n".join(caption_parts)[:1024]
+
+                        if isinstance(item, DownloadedImage):
+                            media_group.append(InputMediaPhoto(media=f, caption=caption))
+                        elif isinstance(item, DownloadedVideo):
+                            media_group.append(InputMediaVideo(media=f, caption=caption))
+
+                    await message.reply_media_group(media=media_group)
+                finally:
+                    for f in files:
+                        f.close()
+
+            await _upload_with_retry(_send_media_group)
+            await status_message.edit_text("Fertig.")
         elif isinstance(media, DownloadedImage):
-            with media.file_path.open("rb") as file_handle:
-                caption_parts = [media.title]
-                if media.uploader:
-                    caption_parts.append(f"Quelle: {media.uploader}")
-                caption = "\n".join(caption_parts)[:1024]
-                if media.is_gif:
-                    await message.reply_animation(
-                        animation=file_handle,
-                        caption=caption,
-                    )
-                else:
-                    await message.reply_photo(
-                        photo=file_handle,
-                        caption=caption,
-                    )
+            caption_parts = [media.title]
+            if media.uploader:
+                caption_parts.append(f"Quelle: {media.uploader}")
+            caption = "\n".join(caption_parts)[:1024]
+
+            async def _send_image() -> None:
+                with media.file_path.open("rb") as file_handle:
+                    if media.is_gif:
+                        await message.reply_animation(
+                            animation=file_handle,
+                            caption=caption,
+                        )
+                    else:
+                        await message.reply_photo(
+                            photo=file_handle,
+                            caption=caption,
+                        )
+
+            await _upload_with_retry(_send_image)
             await status_message.edit_text("Fertig.")
         else:
             caption_parts = [media.title]
             if media.uploader:
                 caption_parts.append(f"Quelle: {media.uploader}")
             caption = "\n".join(caption_parts)
- 
-            with media.file_path.open("rb") as file_handle:
-                await message.reply_video(
-                    video=file_handle,
-                    caption=caption[:1024],
-                    supports_streaming=True,
-                )
+
+            async def _send_video() -> None:
+                with media.file_path.open("rb") as file_handle:
+                    await message.reply_video(
+                        video=file_handle,
+                        caption=caption[:1024],
+                        supports_streaming=True,
+                    )
+
+            await _upload_with_retry(_send_video)
             await status_message.edit_text("Fertig.")
     except DownloaderError as exc:
         LOGGER.warning("Downloader error for %s: %s", url, exc)
         await status_message.edit_text(f"Download fehlgeschlagen: {exc}")
+    except NetworkError as exc:
+        LOGGER.warning("Network error while uploading %s: %s", url, exc)
+        await status_message.edit_text(
+            "Der Upload zu Telegram ist an einem Netzwerkfehler gescheitert. "
+            "Bitte versuch es gleich noch einmal."
+        )
     finally:
         if "media" in locals():
             if isinstance(media, list):
