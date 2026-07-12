@@ -75,6 +75,32 @@ def looks_like_auth_error(message: str) -> bool:
     return any(marker in low for marker in _AUTH_REQUIRED_MARKERS)
 
 
+_NETSCAPE_HEADER = "# Netscape HTTP Cookie File"
+_HTTPONLY_PREFIX = "#HttpOnly_"
+
+
+def _cookie_line_domain(line: str) -> str | None:
+    """Domainfeld einer Netscape-Cookie-Zeile, oder None fuer Kommentar/Leerzeile.
+
+    ``#HttpOnly_``-Zeilen sind echte Cookies (kein Kommentar) und werden beruecksichtigt.
+    """
+    candidate = line
+    if candidate.startswith(_HTTPONLY_PREFIX):
+        candidate = candidate[len(_HTTPONLY_PREFIX):]
+    elif candidate.startswith("#") or not candidate.strip():
+        return None
+    fields = candidate.split("\t")
+    if len(fields) < 7:
+        return None
+    return fields[0].lstrip(".").lower()
+
+
+def _base_domain(domain: str) -> str:
+    """Registrierbare Basis-Domain (vereinfacht: die letzten zwei Labels)."""
+    parts = domain.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else domain
+
+
 def looks_like_cookies(text: str) -> bool:
     """Grobe Pruefung, ob ein Text eine Netscape-cookies.txt ist."""
     stripped = text.lstrip()
@@ -82,11 +108,30 @@ def looks_like_cookies(text: str) -> bool:
         return True
     # Netscape-Datenzeilen: domain \t flag \t path \t secure \t expiry \t name \t value
     for line in text.splitlines():
-        if line.startswith("#") or not line.strip():
-            continue
-        if line.count("\t") >= 6:
+        if _cookie_line_domain(line) is not None:
             return True
     return False
+
+
+def merge_cookie_files(old_text: str, new_text: str) -> str:
+    """Fuehrt zwei Netscape-cookies.txt nach Basis-Domain zusammen.
+
+    Domains, die in ``new_text`` vorkommen, werden komplett durch die neuen Cookies
+    ersetzt (frischer Export = vollstaendiger aktueller Satz dieser Domain); alle
+    anderen Domains aus ``old_text`` bleiben erhalten. So kann man z.B. TikTok
+    aktualisieren, ohne bestehende Instagram-Cookies zu verlieren.
+    """
+    new_lines = [ln for ln in new_text.splitlines() if _cookie_line_domain(ln) is not None]
+    new_bases = {_base_domain(_cookie_line_domain(ln)) for ln in new_lines}  # type: ignore[arg-type]
+
+    kept_old = [
+        ln
+        for ln in old_text.splitlines()
+        if (dom := _cookie_line_domain(ln)) is not None and _base_domain(dom) not in new_bases
+    ]
+
+    body = kept_old + new_lines
+    return _NETSCAPE_HEADER + "\n" + "\n".join(body) + "\n"
 
 
 class DownloaderError(Exception):
@@ -536,6 +581,10 @@ class VideoDownloader:
     def save_cookies(self, content: str) -> None:
         """Speichert vom User gelieferte Cookies dauerhaft in der Cookie-Datei.
 
+        Neue Cookies werden nach Basis-Domain mit vorhandenen zusammengefuehrt
+        (siehe :func:`merge_cookie_files`), sodass z.B. TikTok aktualisiert werden
+        kann, ohne bestehende Instagram-Cookies zu verlieren.
+
         Bewusst *in place* (open 'w'), damit ein evtl. Docker-Bind-Mount der Datei
         erhalten bleibt (ein Rename wuerde den Mount loesen und die Aenderung ginge
         beim Container-Neustart verloren).
@@ -544,8 +593,14 @@ class VideoDownloader:
             raise DownloaderError("Kein Cookie-Pfad konfiguriert")
         path = Path(self.cookies_file_path)
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        existing = ""
+        if path.exists():
+            existing = path.read_text(encoding="utf-8", errors="replace")
+        merged = merge_cookie_files(existing, content)
+
         with open(path, "w", encoding="utf-8") as handle:
-            handle.write(content if content.endswith("\n") else content + "\n")
+            handle.write(merged)
             handle.flush()
             os.fsync(handle.fileno())
 
