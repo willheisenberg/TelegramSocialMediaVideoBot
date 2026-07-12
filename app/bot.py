@@ -19,6 +19,17 @@ UPLOAD_MAX_ATTEMPTS = 3
 UPLOAD_RETRY_BASE_DELAY = 2.0
 
 
+def _is_too_large_error(exc: Exception) -> bool:
+    """Erkennt den Telegram-Fehler ``413 Request Entity Too Large``.
+
+    Dieser Fehler ist nicht transient (die Datei wird durch Wiederholen nicht
+    kleiner), daher darf er weder wiederholt noch als Netzwerkfehler behandelt
+    werden.
+    """
+    message = str(exc).lower()
+    return "413" in message or "too large" in message or "entity too large" in message
+
+
 async def _upload_with_retry(send_coro_factory):
     """Fuehrt einen Upload aus und wiederholt ihn bei transienten Netzwerkfehlern.
 
@@ -31,7 +42,8 @@ async def _upload_with_retry(send_coro_factory):
             await send_coro_factory()
             return
         except NetworkError as exc:
-            if attempt == UPLOAD_MAX_ATTEMPTS:
+            # 413 ist dauerhaft: nicht wiederholen, sondern direkt weiterreichen.
+            if _is_too_large_error(exc) or attempt == UPLOAD_MAX_ATTEMPTS:
                 raise
             LOGGER.warning(
                 "Upload-Versuch %d/%d fehlgeschlagen (%s), neuer Versuch...",
@@ -189,11 +201,18 @@ async def handle_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         LOGGER.warning("Downloader error for %s: %s", url, exc)
         await status_message.edit_text(f"Download fehlgeschlagen: {exc}")
     except NetworkError as exc:
-        LOGGER.warning("Network error while uploading %s: %s", url, exc)
-        await status_message.edit_text(
-            "Der Upload zu Telegram ist an einem Netzwerkfehler gescheitert. "
-            "Bitte versuch es gleich noch einmal."
-        )
+        if _is_too_large_error(exc):
+            LOGGER.warning("Upload too large for %s: %s", url, exc)
+            await status_message.edit_text(
+                "Das Video ist zu gross fuer den Telegram-Upload (max. 50 MB) "
+                "und konnte nicht gesendet werden."
+            )
+        else:
+            LOGGER.warning("Network error while uploading %s: %s", url, exc)
+            await status_message.edit_text(
+                "Der Upload zu Telegram ist an einem Netzwerkfehler gescheitert. "
+                "Bitte versuch es gleich noch einmal."
+            )
     finally:
         if "media" in locals():
             if isinstance(media, list):

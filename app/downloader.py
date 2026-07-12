@@ -2,14 +2,53 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
+
+LOGGER = logging.getLogger(__name__)
+
+# Transiente Download-Fehler (v.a. YouTube liefert sporadisch HTTP 403, wenn der
+# gerade gewaehlte Player-Client geblockt wird) werden mehrfach wiederholt. Jeder
+# neue Versuch loest die Extraktion neu aus und kann so einen funktionierenden
+# Client erwischen.
+DOWNLOAD_MAX_ATTEMPTS = 3
+DOWNLOAD_RETRY_BASE_DELAY = 3.0
+
+# Puffer (MB), der bei getrennten Video-/Audio-Streams von der Videogroesse
+# abgezogen wird, damit video+audio nach dem Merge unter dem Upload-Limit bleiben.
+AUDIO_HEADROOM_MB = 8
+
+# Aufloesungs-Leiter fuer den Download. yt-dlps Groessenschaetzungen sind oft
+# ungenau, daher wird nach dem Download die tatsaechliche Dateigroesse geprueft:
+# Ist die Datei zu gross fuers Telegram-Upload-Limit, wird mit dem naechsten
+# (kleineren) Hoehen-Deckel erneut geladen, bis sie passt. ``None`` = beste
+# Auswahl unter geschaetztem Limit (haeufig der einzige noetige Versuch).
+RESOLUTION_LADDER: tuple[int | None, ...] = (None, 720, 480, 360, 240)
+
+_TRANSIENT_ERROR_MARKERS = (
+    "http error 403",
+    "forbidden",
+    "unable to download video data",
+    "unable to download webpage",
+    "fragment",
+    "read timed out",
+    "connection reset",
+    "http error 5",  # 500/502/503/504
+    "temporarily",
+)
+
+
+def _is_transient_download_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _TRANSIENT_ERROR_MARKERS)
 
 
 class DownloaderError(Exception):
@@ -186,48 +225,24 @@ class VideoDownloader:
     def _download_sync(self, url: str) -> DownloadedVideo | DownloadedImage:
         with tempfile.TemporaryDirectory(dir=self.download_dir) as tmp_dir:
             output_template = os.path.join(tmp_dir, "%(title).80s-%(id)s.%(ext)s")
-            # Formatauswahl mit zwei Zielen, in Prioritaetsreihenfolge:
-            #   1. Groesse <= Telegram-Upload-Limit (sonst scheitert der Upload),
-            #   2. immer eine Tonspur (kein stummes Video).
-            # Deshalb zuerst Merge-Zweige mit Audio (m4a bevorzugt fuer maximale
-            # Player-Kompatibilitaet, sonst beliebiges Audio), dann kombinierte
-            # Formate, die explizit eine Tonspur haben (acodec!=none). Erst als
-            # allerletzter Notnagel steht ein nacktes "b". Der filesize-Filter
-            # greift nur bei bekannter Groesse (exakt oder geschaetzt), daher je
-            # eine Variante fuer filesize und filesize_approx. Was das Limit doch
-            # ueberschreitet, faengt der Groessen-Gate nach dem Download ab.
             size_mb = max(1, self.max_download_size_bytes // (1024 * 1024))
-            format_selection = "/".join(
-                [
-                    # unter Limit, Video+Audio (m4a bevorzugt)
-                    f"bv*[ext=mp4][filesize<={size_mb}M]+ba[ext=m4a]",
-                    f"bv*[ext=mp4][filesize_approx<={size_mb}M]+ba[ext=m4a]",
-                    f"bv*[ext=mp4][filesize<={size_mb}M]+ba",
-                    f"bv*[ext=mp4][filesize_approx<={size_mb}M]+ba",
-                    # unter Limit, kombiniertes Format mit garantierter Tonspur
-                    f"b[ext=mp4][filesize<={size_mb}M][acodec!=none]",
-                    f"b[filesize<={size_mb}M][acodec!=none]",
-                    f"b[filesize_approx<={size_mb}M][acodec!=none]",
-                    # ohne Groessengrenze, aber weiterhin mit Ton
-                    "bv*[ext=mp4]+ba[ext=m4a]",
-                    "bv*[ext=mp4]+ba",
-                    "b[ext=mp4][acodec!=none]",
-                    "b[acodec!=none]",
-                    # absoluter Notnagel (evtl. stumm, aber besser als gar nichts)
-                    "b",
-                ]
-            )
+            # Bei getrennten Streams begrenzt der filesize-Filter nur die Videospur;
+            # die Tonspur kommt beim Mergen obendrauf. Damit video+audio zusammen
+            # unter dem Limit bleiben (sonst 413 beim Telegram-Upload), bekommt die
+            # Videospur ein etwas kleineres Budget mit Puffer fuer das Audio.
+            video_mb = max(1, size_mb - AUDIO_HEADROOM_MB)
             ydl_opts: dict[str, Any] = {
                 "outtmpl": output_template,
-                "format": format_selection,
-                # Innerhalb der obigen Auswahl h264 bevorzugen (auf allen Telegram-
-                # Clients abspielbar); h265/HEVC nur, wenn kein h264 verfuegbar ist.
+                # Das konkrete Format wird pro Aufloesungsstufe gesetzt (siehe unten).
+                # h264 bevorzugen (auf allen Telegram-Clients abspielbar); h265/HEVC
+                # nur, wenn kein h264 verfuegbar ist.
                 "format_sort": ["vcodec:h264"],
                 "merge_output_format": "mp4",
                 "noplaylist": True,
                 "quiet": True,
                 "no_warnings": True,
                 "restrictfilenames": True,
+                "overwrites": True,
             }
 
             if self.cookies_file_path and os.path.exists(self.cookies_file_path):
@@ -350,23 +365,59 @@ class VideoDownloader:
                                     return downloaded_images[0]
                                 return downloaded_images
 
-                    self._ensure_size_is_allowed(info)
-                    downloaded_info = ydl.extract_info(url, download=True)
-                    final_path = Path(ydl.prepare_filename(downloaded_info))
+                # Kein Bild -> Video laden. yt-dlps Groessenschaetzung ist unzuverlaessig,
+                # daher wird die *tatsaechliche* Dateigroesse nach dem Download geprueft
+                # und bei Ueberschreitung mit kleinerer Aufloesung erneut geladen. Jede
+                # Stufe schreibt in ein eigenes Unterverzeichnis, damit Reste einer zu
+                # grossen Variante die naechste nicht stoeren.
+                final_path = None
+                downloaded_info = None
+                for idx, max_height in enumerate(RESOLUTION_LADDER):
+                    tier_opts = dict(ydl_opts)
+                    tier_opts["format"] = self._build_format_selection(size_mb, video_mb, max_height)
+                    tier_opts["outtmpl"] = os.path.join(
+                        tmp_dir, str(idx), "%(title).80s-%(id)s.%(ext)s"
+                    )
+                    try:
+                        with YoutubeDL(tier_opts) as ydl:
+                            candidate_info = self._extract_with_retry(ydl, url)
+                            candidate_path = self._resolve_final_path(
+                                Path(ydl.prepare_filename(candidate_info))
+                            )
+                    except DownloadError as exc:
+                        # Auf einer Stufe kann das (audio-pflichtige) Wunschformat fehlen;
+                        # dann die naechste, kleinere Stufe versuchen statt abzubrechen.
+                        if idx < len(RESOLUTION_LADDER) - 1:
+                            LOGGER.info(
+                                "Kein passendes Format bei %s (%s), versuche kleinere Aufloesung...",
+                                self._tier_label(max_height),
+                                exc,
+                            )
+                            continue
+                        raise DownloaderError(f"Download failed: {exc}") from exc
+
+                    if not candidate_path.exists():
+                        raise DownloaderError("Downloaded file could not be found")
+
+                    candidate_size = candidate_path.stat().st_size
+                    if candidate_size <= self.max_download_size_bytes:
+                        final_path = candidate_path
+                        downloaded_info = candidate_info
+                        break
+
+                    LOGGER.info(
+                        "Datei zu gross (%.1f MB) bei %s, versuche kleinere Aufloesung...",
+                        candidate_size / (1024 * 1024),
+                        self._tier_label(max_height),
+                    )
+                    candidate_path.unlink(missing_ok=True)
+
+                if final_path is None:
+                    raise DownloaderError(
+                        "The downloaded video is too large for Telegram upload"
+                    )
             except DownloadError as exc:
                 raise DownloaderError(f"Download failed: {exc}") from exc
-
-            if final_path.suffix != ".mp4":
-                candidate = final_path.with_suffix(".mp4")
-                if candidate.exists():
-                    final_path = candidate
-
-            if not final_path.exists():
-                raise DownloaderError("Downloaded file could not be found")
-
-            size = final_path.stat().st_size
-            if size > self.max_download_size_bytes:
-                raise DownloaderError("The downloaded video is too large for Telegram upload")
 
             persistent_path = self.download_dir / final_path.name
             final_path.replace(persistent_path)
@@ -378,25 +429,71 @@ class VideoDownloader:
                 uploader=downloaded_info.get("uploader"),
             )
 
-    def _ensure_size_is_allowed(self, info: dict[str, Any]) -> None:
-        size_candidates = [
-            info.get("filesize"),
-            info.get("filesize_approx"),
+    def _extract_with_retry(self, ydl: YoutubeDL, url: str) -> dict[str, Any]:
+        """Laedt das Video herunter und wiederholt transiente Fehler (z.B. 403).
+
+        Ein erneuter ``extract_info``-Aufruf wiederholt die komplette Extraktion,
+        wodurch yt-dlp einen anderen Player-Client waehlen kann. Nicht-transiente
+        Fehler (z.B. privates/geloeschtes Video) werden sofort weitergereicht.
+        """
+        for attempt in range(1, DOWNLOAD_MAX_ATTEMPTS + 1):
+            try:
+                return ydl.extract_info(url, download=True)
+            except DownloadError as exc:
+                if attempt == DOWNLOAD_MAX_ATTEMPTS or not _is_transient_download_error(exc):
+                    raise
+                LOGGER.warning(
+                    "Download-Versuch %d/%d fuer %s fehlgeschlagen (%s), neuer Versuch...",
+                    attempt,
+                    DOWNLOAD_MAX_ATTEMPTS,
+                    url,
+                    exc,
+                )
+                time.sleep(DOWNLOAD_RETRY_BASE_DELAY * attempt)
+        # Unerreichbar: Die Schleife kehrt entweder zurueck oder wirft.
+        raise DownloaderError("Download failed: retries exhausted")
+
+    @staticmethod
+    def _tier_label(max_height: int | None) -> str:
+        return f"height<={max_height}" if max_height else "beste Auswahl"
+
+    def _build_format_selection(self, size_mb: int, video_mb: int, max_height: int | None) -> str:
+        """Baut die yt-dlp-Formatauswahl fuer eine Aufloesungsstufe.
+
+        Jeder Zweig erzwingt eine Tonspur (getrennte Streams via ``+ba`` bzw.
+        kombinierte Formate mit ``acodec!=none``) — es gibt bewusst keinen stummen
+        Notnagel: lieber ein Fehler als ein Video ohne Ton. Bei getrennten Streams
+        begrenzt der filesize-Filter nur das Video (Audio kommt beim Merge dazu),
+        daher das kleinere ``video_mb``-Budget. ``filesize`` und ``filesize_approx``
+        jeweils separat, weil yt-dlp die Groesse nicht immer exakt kennt.
+        """
+        hf = f"[height<={max_height}]" if max_height else ""
+        branches = [
+            # unter Limit, getrennte Streams (m4a-Audio bevorzugt fuer Kompatibilitaet)
+            f"bv*[ext=mp4]{hf}[filesize<={video_mb}M]+ba[ext=m4a]",
+            f"bv*[ext=mp4]{hf}[filesize_approx<={video_mb}M]+ba[ext=m4a]",
+            f"bv*[ext=mp4]{hf}[filesize<={video_mb}M]+ba",
+            f"bv*[ext=mp4]{hf}[filesize_approx<={video_mb}M]+ba",
+            # unter Limit, kombiniertes Format mit garantierter Tonspur
+            f"b[ext=mp4]{hf}[filesize<={size_mb}M][acodec!=none]",
+            f"b{hf}[filesize<={size_mb}M][acodec!=none]",
+            f"b{hf}[filesize_approx<={size_mb}M][acodec!=none]",
+            # ohne Schaetz-Groessengrenze, aber innerhalb der Hoehe und mit Ton
+            # (die tatsaechliche Groesse prueft die aufrufende Schleife danach)
+            f"bv*[ext=mp4]{hf}+ba[ext=m4a]",
+            f"bv*[ext=mp4]{hf}+ba",
+            f"b[ext=mp4]{hf}[acodec!=none]",
+            f"b{hf}[acodec!=none]",
         ]
+        return "/".join(branches)
 
-        requested_formats = info.get("requested_formats") or []
-        for fmt in requested_formats:
-            size_candidates.append(fmt.get("filesize"))
-            size_candidates.append(fmt.get("filesize_approx"))
-
-        formats = info.get("formats") or []
-        for fmt in formats:
-            size_candidates.append(fmt.get("filesize"))
-            size_candidates.append(fmt.get("filesize_approx"))
-
-        known_sizes = [size for size in size_candidates if isinstance(size, int)]
-        if known_sizes and min(known_sizes) > self.max_download_size_bytes:
-            raise DownloaderError("The source video exceeds the configured upload size limit")
+    def _resolve_final_path(self, final_path: Path) -> Path:
+        """Korrigiert die Dateiendung auf die gemergte .mp4-Datei, falls noetig."""
+        if final_path.suffix != ".mp4":
+            candidate = final_path.with_suffix(".mp4")
+            if candidate.exists():
+                return candidate
+        return final_path
 
     def cleanup(self, file_path: Path) -> None:
         with contextlib.suppress(FileNotFoundError):

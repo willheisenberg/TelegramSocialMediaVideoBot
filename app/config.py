@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
+
+LOGGER = logging.getLogger(__name__)
+
+# Harte Obergrenze der Telegram-Bot-API fuer per Upload gesendete Dateien (50 MB).
+# Alles darueber quittiert Telegram mit HTTP 413. Da jede heruntergeladene Datei
+# anschliessend hochgeladen wird, darf das Download-Limit dieses Maximum nie
+# ueberschreiten. Ein Puffer laesst Platz fuer Container-/Multipart-Overhead.
+TELEGRAM_UPLOAD_LIMIT_MB = 50
 
 
 @dataclass(frozen=True)
@@ -40,6 +49,14 @@ def load_settings() -> Settings:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
 
     max_download_size_mb = int(os.getenv("MAX_DOWNLOAD_SIZE_MB", "49"))
+    if max_download_size_mb > TELEGRAM_UPLOAD_LIMIT_MB:
+        LOGGER.warning(
+            "MAX_DOWNLOAD_SIZE_MB=%d ueberschreitet das Telegram-Upload-Limit (%d MB) "
+            "und wird darauf begrenzt, um HTTP-413-Fehler zu vermeiden.",
+            max_download_size_mb,
+            TELEGRAM_UPLOAD_LIMIT_MB,
+        )
+        max_download_size_mb = TELEGRAM_UPLOAD_LIMIT_MB
     download_dir = os.getenv("DOWNLOAD_DIR", "/tmp/telegram-social-bot").strip()
 
     cookies_file_path = os.getenv("COOKIES_FILE_PATH", "").strip()

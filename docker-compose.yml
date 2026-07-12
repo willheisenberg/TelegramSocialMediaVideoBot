@@ -2,6 +2,8 @@ services:
   telegram-social-bot:
     build:
       context: .
+      args:
+        CACHE_BUST: ${CACHE_BUST:-unknown}
     container_name: telegram-social-bot
     restart: unless-stopped
     env_file:

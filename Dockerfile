@@ -12,6 +12,13 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# yt-dlp/gallery-dl brechen bei jeder YouTube-/Plattform-Aenderung; deshalb bei
+# jedem Build die neueste Version ziehen. CACHE_BUST (vom deploy.sh mit einem
+# Zeitstempel gesetzt) invalidiert diese Layer bei jedem Deploy erneut, sonst
+# wuerde Docker den Upgrade-Schritt cachen und wieder eine alte Version behalten.
+ARG CACHE_BUST=unknown
+RUN pip install --no-cache-dir --upgrade yt-dlp gallery-dl
+
 COPY app ./app
 COPY main.py .
 
