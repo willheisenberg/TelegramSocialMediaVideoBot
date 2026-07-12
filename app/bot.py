@@ -135,6 +135,16 @@ async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.effective_message.reply_text(COOKIES_INSTRUCTIONS)
 
 
+async def _delete_message_safe(message) -> bool:
+    """Loescht eine Nachricht und schluckt Fehler (Rechte fehlen, zu alt, ...)."""
+    try:
+        await message.delete()
+        return True
+    except Exception as exc:  # TelegramError o.ae. – Loeschen ist best effort
+        LOGGER.warning("Konnte Cookie-Nachricht nicht loeschen: %s", exc)
+        return False
+
+
 async def _store_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE, content: str) -> None:
     """Validiert und speichert vom User gelieferte Cookies, meldet das Ergebnis zurueck."""
     message = update.effective_message
@@ -152,9 +162,22 @@ async def _store_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE, con
         await message.reply_text("Die Cookies konnten nicht gespeichert werden.")
         return
     LOGGER.info("Cookies aktualisiert (%d Bytes)", len(content.encode("utf-8")))
-    await message.reply_text(
+
+    # Die eingehende Nachricht enthaelt sensible Login-Cookies (sessionid o.ae.).
+    # Aus Sicherheitsgruenden aus dem Chat-Verlauf entfernen. In privaten Chats
+    # darf der Bot eingehende Nachrichten loeschen; klappt es nicht (z.B. Gruppe
+    # ohne Rechte, zu alt), weisen wir den User darauf hin.
+    deleted = await _delete_message_safe(message)
+    if deleted:
+        note = "Deine Nachricht mit den Cookies habe ich zur Sicherheit geloescht."
+    else:
+        note = (
+            "Bitte loesche deine Cookie-Nachricht selbst aus dem Chat – "
+            "sie enthaelt sensible Login-Daten."
+        )
+    await message.chat.send_message(
         "Cookies gespeichert. Ab jetzt nutze ich sie fuer Downloads – "
-        "schick den Link einfach nochmal."
+        "schick den Link einfach nochmal.\n\n" + note
     )
 
 
