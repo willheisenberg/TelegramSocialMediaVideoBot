@@ -59,14 +59,12 @@ def load_settings() -> Settings:
         max_download_size_mb = TELEGRAM_UPLOAD_LIMIT_MB
     download_dir = os.getenv("DOWNLOAD_DIR", "/tmp/telegram-social-bot").strip()
 
+    # Cookie-Datei: immer einen Pfad liefern (auch wenn die Datei noch nicht
+    # existiert), damit der Bot vom User gesendete Cookies dort anlegen/aktualisieren
+    # kann. Verwendet wird sie nur, wenn sie tatsaechlich existiert (siehe Downloader).
     cookies_file_path = os.getenv("COOKIES_FILE_PATH", "").strip()
     if not cookies_file_path:
-        # Fallback to local cookies.txt in workspace root if it exists
-        local_cookies = os.path.join(os.getcwd(), "cookies.txt")
-        if os.path.exists(local_cookies):
-            cookies_file_path = local_cookies
-        else:
-            cookies_file_path = None
+        cookies_file_path = os.path.join(os.getcwd(), "cookies.txt")
 
     extractor_username = os.getenv("EXTRACTOR_USERNAME", "").strip() or None
     extractor_password = os.getenv("EXTRACTOR_PASSWORD", "").strip() or None

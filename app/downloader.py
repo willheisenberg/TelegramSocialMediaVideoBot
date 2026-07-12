@@ -51,6 +51,44 @@ def _is_transient_download_error(exc: Exception) -> bool:
     return any(marker in message for marker in _TRANSIENT_ERROR_MARKERS)
 
 
+# Marker in yt-dlp-Fehlern, die auf fehlenden Login/Cookies hindeuten.
+_AUTH_REQUIRED_MARKERS = (
+    "log in",
+    "login",
+    "sign in",
+    "cookies",
+    "authentication",
+    "private video",
+    "this video is private",
+    "members-only",
+    "not be comfortable",
+    "age-restricted",
+    "age restricted",
+    "confirm your age",
+    "verify your age",
+)
+
+
+def looks_like_auth_error(message: str) -> bool:
+    """True, wenn ein Download-Fehler nach fehlendem Login/Cookies aussieht."""
+    low = message.lower()
+    return any(marker in low for marker in _AUTH_REQUIRED_MARKERS)
+
+
+def looks_like_cookies(text: str) -> bool:
+    """Grobe Pruefung, ob ein Text eine Netscape-cookies.txt ist."""
+    stripped = text.lstrip()
+    if stripped.lower().startswith(("# netscape http cookie file", "# http cookie file")):
+        return True
+    # Netscape-Datenzeilen: domain \t flag \t path \t secure \t expiry \t name \t value
+    for line in text.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        if line.count("\t") >= 6:
+            return True
+    return False
+
+
 class DownloaderError(Exception):
     pass
 
@@ -494,6 +532,22 @@ class VideoDownloader:
             if candidate.exists():
                 return candidate
         return final_path
+
+    def save_cookies(self, content: str) -> None:
+        """Speichert vom User gelieferte Cookies dauerhaft in der Cookie-Datei.
+
+        Bewusst *in place* (open 'w'), damit ein evtl. Docker-Bind-Mount der Datei
+        erhalten bleibt (ein Rename wuerde den Mount loesen und die Aenderung ginge
+        beim Container-Neustart verloren).
+        """
+        if not self.cookies_file_path:
+            raise DownloaderError("Kein Cookie-Pfad konfiguriert")
+        path = Path(self.cookies_file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(content if content.endswith("\n") else content + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def cleanup(self, file_path: Path) -> None:
         with contextlib.suppress(FileNotFoundError):

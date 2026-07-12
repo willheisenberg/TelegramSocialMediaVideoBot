@@ -16,6 +16,7 @@ Durch die nahtlose Integration von `yt-dlp` und `gallery-dl` werden auch passwor
 - **Universal-Cookies & Plattform-Credentials:**
   - Automatische Erkennung einer `cookies.txt` (Netscape-Format) im Stammverzeichnis für universellen Session-Zugriff.
   - Dynamisches Routing von plattformspezifischen Zugangsdaten (Instagram, YouTube, Twitter, TikTok) direkt über die `.env`-Konfiguration.
+  - **Cookies per Telegram (`/cookies`):** Schlägt ein Download wegen fehlendem Login fehl (z. B. private oder altersbeschränkte Videos), kann die `cookies.txt` direkt im Chat als Datei gesendet oder als Text eingefügt werden. Sie wird dauerhaft gespeichert und ab dann für alle Downloads genutzt.
 
 ---
 
