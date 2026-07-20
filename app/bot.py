@@ -25,8 +25,8 @@ MAX_COOKIES_BYTES = 1_000_000
 LOGGER = logging.getLogger(__name__)
 URL_PATTERN = re.compile(r"https?://\S+")
 
-UPLOAD_MAX_ATTEMPTS = 3
-UPLOAD_RETRY_BASE_DELAY = 2.0
+TELEGRAM_MAX_ATTEMPTS = 3
+TELEGRAM_RETRY_BASE_DELAY = 2.0
 
 
 def _is_too_large_error(exc: Exception) -> bool:
@@ -40,28 +40,53 @@ def _is_too_large_error(exc: Exception) -> bool:
     return "413" in message or "too large" in message or "entity too large" in message
 
 
-async def _upload_with_retry(send_coro_factory):
-    """Fuehrt einen Upload aus und wiederholt ihn bei transienten Netzwerkfehlern.
+async def _telegram_with_retry(coro_factory, *, description: str = "Telegram-Aufruf"):
+    """Fuehrt einen Telegram-Aufruf aus und wiederholt ihn bei transienten Netzwerkfehlern.
 
-    ``send_coro_factory`` muss bei jedem Aufruf eine frische Coroutine liefern und
-    die Datei-Handles selbst neu oeffnen, damit der Lesezeiger nach einem
-    Fehlversuch wieder am Dateianfang steht.
+    ``coro_factory`` muss bei jedem Aufruf eine frische Coroutine liefern (und bei
+    Uploads die Datei-Handles neu oeffnen, damit der Lesezeiger nach einem
+    Fehlversuch wieder am Dateianfang steht). Der Rueckgabewert der Coroutine wird
+    durchgereicht (z.B. das gesendete ``Message``-Objekt).
     """
-    for attempt in range(1, UPLOAD_MAX_ATTEMPTS + 1):
+    for attempt in range(1, TELEGRAM_MAX_ATTEMPTS + 1):
         try:
-            await send_coro_factory()
-            return
+            return await coro_factory()
         except NetworkError as exc:
             # 413 ist dauerhaft: nicht wiederholen, sondern direkt weiterreichen.
-            if _is_too_large_error(exc) or attempt == UPLOAD_MAX_ATTEMPTS:
+            if _is_too_large_error(exc) or attempt == TELEGRAM_MAX_ATTEMPTS:
                 raise
             LOGGER.warning(
-                "Upload-Versuch %d/%d fehlgeschlagen (%s), neuer Versuch...",
+                "%s fehlgeschlagen (Versuch %d/%d): %s – neuer Versuch...",
+                description,
                 attempt,
-                UPLOAD_MAX_ATTEMPTS,
+                TELEGRAM_MAX_ATTEMPTS,
                 exc,
             )
-            await asyncio.sleep(UPLOAD_RETRY_BASE_DELAY * attempt)
+            await asyncio.sleep(TELEGRAM_RETRY_BASE_DELAY * attempt)
+
+
+async def _report_safe(status_message, chat, text: str) -> None:
+    """Meldet ``text`` bestmoeglich an den User.
+
+    Erst wird versucht, die bestehende Status-Nachricht zu editieren (mit Retry).
+    Klappt das nicht, wird eine neue Nachricht in den Chat gesendet (mit Retry).
+    Scheitert auch das, bleibt nur der Log-Eintrag – ein Fehler beim Melden darf
+    nie die weitere Verarbeitung abbrechen.
+    """
+    if status_message is not None:
+        try:
+            await _telegram_with_retry(
+                lambda: status_message.edit_text(text), description="Status-Update"
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 – Melden ist best effort
+            LOGGER.warning("Konnte Status-Nachricht nicht aktualisieren: %s", exc)
+    try:
+        await _telegram_with_retry(
+            lambda: chat.send_message(text), description="Meldung"
+        )
+    except Exception as exc:  # noqa: BLE001 – letzter Rettungsanker
+        LOGGER.error("Konnte Meldung nicht an Telegram senden: %s", exc)
 
 
 def build_application(settings: Settings) -> Application:
@@ -212,7 +237,23 @@ async def handle_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     url = match.group(0)
     downloader: VideoDownloader = context.application.bot_data["downloader"]
 
-    status_message = await message.reply_text("Download gestartet...")
+    # Startnachricht selbst kann an einem Netzwerkfehler scheitern – daher mit
+    # Retry senden. Klappt es endgueltig nicht, versuchen wir wenigstens noch eine
+    # Fehlermeldung (best effort) und brechen ab.
+    try:
+        status_message = await _telegram_with_retry(
+            lambda: message.reply_text("Download gestartet..."),
+            description="Status-Nachricht",
+        )
+    except NetworkError as exc:
+        LOGGER.warning("Konnte Download-Status nicht senden fuer %s: %s", url, exc)
+        await _report_safe(
+            None,
+            message.chat,
+            "Ich konnte gerade nicht mit Telegram sprechen (Netzwerkfehler). "
+            "Bitte schick den Link gleich noch einmal.",
+        )
+        return
 
     # Determine chat action based on whether it is an image or video
     is_image, is_gif = await asyncio.to_thread(downloader._check_if_image, url)
@@ -221,7 +262,12 @@ async def handle_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     else:
         action = ChatAction.UPLOAD_VIDEO
 
-    await context.bot.send_chat_action(chat_id=message.chat_id, action=action)
+    # Nur der Tipp-Indikator – Fehler hier sind unkritisch und duerfen den Ablauf
+    # nicht stoppen.
+    try:
+        await context.bot.send_chat_action(chat_id=message.chat_id, action=action)
+    except NetworkError as exc:
+        LOGGER.debug("Konnte Chat-Action nicht senden: %s", exc)
 
     try:
         media = await downloader.download(url)
@@ -254,8 +300,8 @@ async def handle_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     for f in files:
                         f.close()
 
-            await _upload_with_retry(_send_media_group)
-            await status_message.edit_text("Fertig.")
+            await _telegram_with_retry(_send_media_group, description="Upload")
+            await _report_safe(status_message, message.chat, "Fertig.")
         elif isinstance(media, DownloadedImage):
             caption_parts = [media.title]
             if media.uploader:
@@ -275,8 +321,8 @@ async def handle_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                             caption=caption,
                         )
 
-            await _upload_with_retry(_send_image)
-            await status_message.edit_text("Fertig.")
+            await _telegram_with_retry(_send_image, description="Upload")
+            await _report_safe(status_message, message.chat, "Fertig.")
         else:
             caption_parts = [media.title]
             if media.uploader:
@@ -291,8 +337,8 @@ async def handle_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         supports_streaming=True,
                     )
 
-            await _upload_with_retry(_send_video)
-            await status_message.edit_text("Fertig.")
+            await _telegram_with_retry(_send_video, description="Upload")
+            await _report_safe(status_message, message.chat, "Fertig.")
     except DownloaderError as exc:
         LOGGER.warning("Downloader error for %s: %s", url, exc)
         text = f"Download fehlgeschlagen: {exc}"
@@ -301,19 +347,23 @@ async def handle_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 "\n\nDieses Video braucht offenbar einen Login. Hinterlege mir mit "
                 "/cookies eine cookies.txt, dann kann ich es laden."
             )
-        await status_message.edit_text(text)
+        await _report_safe(status_message, message.chat, text)
     except NetworkError as exc:
         if _is_too_large_error(exc):
             LOGGER.warning("Upload too large for %s: %s", url, exc)
-            await status_message.edit_text(
+            await _report_safe(
+                status_message,
+                message.chat,
                 "Das Video ist zu gross fuer den Telegram-Upload (max. 50 MB) "
-                "und konnte nicht gesendet werden."
+                "und konnte nicht gesendet werden.",
             )
         else:
             LOGGER.warning("Network error while uploading %s: %s", url, exc)
-            await status_message.edit_text(
-                "Der Upload zu Telegram ist an einem Netzwerkfehler gescheitert. "
-                "Bitte versuch es gleich noch einmal."
+            await _report_safe(
+                status_message,
+                message.chat,
+                "Der Upload zu Telegram ist nach mehreren Versuchen an einem "
+                "Netzwerkfehler gescheitert. Bitte versuch es gleich noch einmal.",
             )
     finally:
         if "media" in locals():
