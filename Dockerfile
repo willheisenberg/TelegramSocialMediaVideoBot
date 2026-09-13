@@ -6,8 +6,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg curl unzip ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# JavaScript-Runtime fuer yt-dlp. YouTube verschluesselt die Format-URLs mit einer
+# in JS ausgelieferten Signatur (nsig); ohne Runtime kann yt-dlp sie nicht loesen
+# und faellt auf Player-Clients zurueck, deren URLs YouTube mangels PO-Token mit
+# HTTP 403 abweist. Deno ist die von yt-dlp standardmaessig unterstuetzte Runtime.
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- -y
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

@@ -323,7 +323,10 @@ class VideoDownloader:
                 "merge_output_format": "mp4",
                 "noplaylist": True,
                 "quiet": True,
-                "no_warnings": True,
+                # Warnungen bewusst nicht unterdruecken: yt-dlp meldet darueber
+                # z. B. eine fehlende JS-Runtime — ohne die Zeile im Log bleibt von
+                # so einem Umgebungsproblem nur ein nacktes HTTP 403 uebrig.
+                "no_warnings": False,
                 "restrictfilenames": True,
                 "overwrites": True,
             }
