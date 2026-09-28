@@ -18,6 +18,7 @@ from app.downloader import (
     looks_like_auth_error,
     looks_like_cookies,
 )
+from app.url_filter import is_supported_url
 
 # Obergrenze fuer hochgeladene Cookie-Dateien (grosszuegig; echte cookies.txt sind klein).
 MAX_COOKIES_BYTES = 1_000_000
@@ -235,6 +236,12 @@ async def handle_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     url = match.group(0)
+    if not is_supported_url(url):
+        # Stillschweigend ignorieren – in Gruppen werden auch normale Links geteilt,
+        # auf die der Bot nicht reagieren soll.
+        LOGGER.info("Link ignoriert (keine unterstuetzte Plattform): %s", url)
+        return
+
     downloader: VideoDownloader = context.application.bot_data["downloader"]
 
     # Startnachricht selbst kann an einem Netzwerkfehler scheitern – daher mit
