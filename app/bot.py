@@ -23,6 +23,13 @@ from app.url_filter import is_supported_url
 # Obergrenze fuer hochgeladene Cookie-Dateien (grosszuegig; echte cookies.txt sind klein).
 MAX_COOKIES_BYTES = 1_000_000
 
+# Nur Textdateien als Cookie-Upload behandeln. GIFs (Telegram schickt sie als
+# Animation, die zugleich als Dokument gilt), PDFs, Bilder usw. ignorieren.
+COOKIES_DOCUMENT_FILTER = (
+    (filters.Document.FileExtension("txt") | filters.Document.MimeType("text/plain"))
+    & ~filters.ANIMATION
+)
+
 LOGGER = logging.getLogger(__name__)
 URL_PATTERN = re.compile(r"https?://\S+")
 
@@ -122,7 +129,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cookies", cookies_command))
     application.add_handler(
-        MessageHandler(filters.Document.ALL, handle_cookies_document)
+        MessageHandler(COOKIES_DOCUMENT_FILTER, handle_cookies_document)
     )
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video_link)
