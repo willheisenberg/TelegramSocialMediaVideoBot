@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from app.downloader import VideoDownloader, split_music_item
+from app.downloader import DownloaderError, VideoDownloader, split_music_item
 
 pytestmark = pytest.mark.skipif(
     not (shutil.which("ffmpeg") and shutil.which("ffprobe")),
@@ -32,6 +32,9 @@ def _duration(path: Path) -> float:
     return float(out.strip())
 
 
+MUSIC_URL = "https://cdn.example/music.m4a"
+
+
 @pytest.fixture
 def downloader(tmp_path: Path) -> VideoDownloader:
     return VideoDownloader(download_dir=str(tmp_path / "dl"), max_download_size_bytes=50 * 1024 * 1024)
@@ -45,10 +48,17 @@ def silent_video(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def music(tmp_path: Path) -> dict:
+def music(tmp_path: Path, downloader: VideoDownloader, monkeypatch) -> dict:
+    """Musik-Eintrag, dessen Download durch eine lokale Testdatei ersetzt ist."""
     path = tmp_path / "music.m4a"
     _ffmpeg("-f", "lavfi", "-i", "sine=frequency=440:duration=20", "-c:a", "aac", str(path))
-    return {"audio_url": path.as_uri(), "audio_timestamps": [5000, 1000]}
+
+    def fake_download(audio_url: str, dest: Path) -> None:
+        assert audio_url == MUSIC_URL
+        shutil.copyfile(path, dest)
+
+    monkeypatch.setattr(downloader, "_download_music_track", fake_download)
+    return {"audio_url": MUSIC_URL, "audio_timestamps": [5000, 1000]}
 
 
 def test_split_music_item_separates_audio_track():
@@ -101,9 +111,39 @@ def test_video_with_own_audio_is_left_untouched(downloader, tmp_path, music):
     assert path.read_bytes() == before
 
 
-def test_failed_music_download_keeps_silent_video(downloader, silent_video, tmp_path):
+def test_failed_music_download_keeps_silent_video(downloader, silent_video, monkeypatch):
+    def failing_download(audio_url: str, dest: Path) -> None:
+        raise OSError("network down")
+
+    monkeypatch.setattr(downloader, "_download_music_track", failing_download)
     before = silent_video.read_bytes()
 
-    downloader._add_music_if_silent(silent_video, {"audio_url": (tmp_path / "missing.m4a").as_uri()})
+    downloader._add_music_if_silent(silent_video, {"audio_url": MUSIC_URL})
 
     assert silent_video.read_bytes() == before
+
+
+@pytest.mark.parametrize("scheme", ["file", "http", "ftp"])
+def test_music_track_is_only_fetched_via_https(downloader, silent_video, tmp_path, scheme):
+    secret = tmp_path / "secret.m4a"
+    _ffmpeg("-f", "lavfi", "-i", "sine=frequency=440:duration=5", "-c:a", "aac", str(secret))
+    url = secret.as_uri() if scheme == "file" else f"{scheme}://cdn.example/music.m4a"
+
+    with pytest.raises(DownloaderError):
+        downloader._download_music_track(url, tmp_path / "out")
+
+    # Ueber den oeffentlichen Weg bleibt das Video dann einfach stumm.
+    downloader._add_music_if_silent(silent_video, {"audio_url": url})
+    assert _streams(silent_video) == ["video"]
+
+
+def test_non_mp4_music_file_is_rejected(downloader, silent_video, tmp_path, monkeypatch):
+    playlist = tmp_path / "evil.m3u8"
+    playlist.write_text("#EXTM3U\n#EXTINF:1,\nfile:///etc/passwd\n")
+    monkeypatch.setattr(
+        downloader, "_download_music_track", lambda url, dest: shutil.copyfile(playlist, dest)
+    )
+
+    downloader._add_music_if_silent(silent_video, {"audio_url": MUSIC_URL})
+
+    assert _streams(silent_video) == ["video"]

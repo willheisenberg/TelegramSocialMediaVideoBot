@@ -145,6 +145,12 @@ _BROWSER_USER_AGENT = (
 )
 
 
+# ffmpeg/ffprobe-Eingabeoptionen fuer heruntergeladene Dateien: nur der
+# MP4-Demuxer und nur lokale Dateien, damit fremde Inhalte weder exotische
+# Demuxer noch Netzwerk-/Verkettungsprotokolle ausloesen koennen.
+_FFMPEG_LOCAL_MP4_INPUT = ("-protocol_whitelist", "file", "-f", "mov")
+
+
 def split_music_item(
     media_items: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
@@ -641,7 +647,7 @@ class VideoDownloader:
         try:
             res = subprocess.run(
                 [
-                    "ffprobe", "-v", "error", "-select_streams", "a",
+                    "ffprobe", "-v", "error", *_FFMPEG_LOCAL_MP4_INPUT, "-select_streams", "a",
                     "-show_entries", "stream=index", "-of", "csv=p=0", str(video_path),
                 ],
                 capture_output=True, text=True, check=True, timeout=30,
@@ -650,6 +656,25 @@ class VideoDownloader:
             LOGGER.warning("ffprobe fuer %s fehlgeschlagen: %s", video_path.name, exc)
             return True
         return bool(res.stdout.strip())
+
+    def _download_music_track(self, audio_url: str, dest: Path) -> None:
+        """Laedt die Musikspur nach ``dest`` — nur per https und groessenbegrenzt.
+
+        Die URL stammt aus den Post-Metadaten; ohne Schema-Pruefung wuerde urllib
+        auch ``file://`` oder ``ftp://`` oeffnen.
+        """
+        import urllib.parse
+        import urllib.request
+
+        if urllib.parse.urlparse(audio_url).scheme != "https":
+            raise DownloaderError("Musikspur-URL ist keine https-URL")
+
+        req = urllib.request.Request(audio_url, headers={"User-Agent": _BROWSER_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = response.read(self.max_download_size_bytes + 1)
+        if len(data) > self.max_download_size_bytes:
+            raise DownloaderError("Musikspur ist zu gross")
+        dest.write_bytes(data)
 
     def _add_music_if_silent(self, video_path: Path, music_item: dict[str, Any]) -> None:
         """Legt die Musik des Posts unter ein Video, das ohne Tonspur geliefert wurde.
@@ -661,7 +686,6 @@ class VideoDownloader:
         Naeherung. Schlaegt etwas fehl, bleibt das stumme Video unveraendert.
         """
         import subprocess
-        import urllib.request
 
         audio_url = music_item.get("audio_url")
         if not audio_url or self._has_audio_stream(video_path):
@@ -676,14 +700,12 @@ class VideoDownloader:
         audio_path = video_path.with_name(f"{video_path.stem}.music")
         muxed_path = video_path.with_name(f"{video_path.stem}.muxed.mp4")
         try:
-            req = urllib.request.Request(audio_url, headers={"User-Agent": _BROWSER_USER_AGENT})
-            with urllib.request.urlopen(req, timeout=30) as response:
-                audio_path.write_bytes(response.read())
+            self._download_music_track(str(audio_url), audio_path)
             subprocess.run(
                 [
                     "ffmpeg", "-y", "-v", "error",
-                    "-i", str(video_path),
-                    "-ss", f"{start_seconds:.3f}", "-i", str(audio_path),
+                    *_FFMPEG_LOCAL_MP4_INPUT, "-i", str(video_path),
+                    "-ss", f"{start_seconds:.3f}", *_FFMPEG_LOCAL_MP4_INPUT, "-i", str(audio_path),
                     "-map", "0:v:0", "-map", "1:a:0",
                     "-c:v", "copy", "-c:a", "aac", "-af", "apad", "-shortest",
                     "-movflags", "+faststart",
