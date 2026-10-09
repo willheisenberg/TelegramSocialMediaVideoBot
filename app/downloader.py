@@ -138,6 +138,28 @@ class DownloaderError(Exception):
     pass
 
 
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def split_music_item(
+    media_items: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Trennt die Musikspur eines Instagram-Posts von den eigentlichen Medien.
+
+    Mit ``audio=merged`` liefert gallery-dl die am Post haengende Musik als
+    zusaetzlichen Eintrag (``audio_url`` gesetzt, ``display_url`` = Cover). Der
+    darf nicht als Bild/Video verschickt werden, sondern dient nur als Tonquelle
+    fuer stumme Videos.
+    """
+    music = next((item for item in media_items if item.get("audio_url")), None)
+    media = [item for item in media_items if not item.get("audio_url")]
+    return media, music
+
+
 @dataclass(frozen=True)
 class DownloadedVideo:
     file_path: Path
@@ -611,7 +633,80 @@ class VideoDownloader:
         with contextlib.suppress(FileNotFoundError):
             file_path.unlink()
 
-    def _download_single_gallery_item(self, selected_item: dict[str, Any], url: str, tmp_dir: str) -> DownloadedVideo | DownloadedImage:
+    @staticmethod
+    def _has_audio_stream(video_path: Path) -> bool:
+        """True, wenn die Datei eine Tonspur hat (im Zweifel True -> nichts anfassen)."""
+        import subprocess
+
+        try:
+            res = subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-select_streams", "a",
+                    "-show_entries", "stream=index", "-of", "csv=p=0", str(video_path),
+                ],
+                capture_output=True, text=True, check=True, timeout=30,
+            )
+        except Exception as exc:
+            LOGGER.warning("ffprobe fuer %s fehlgeschlagen: %s", video_path.name, exc)
+            return True
+        return bool(res.stdout.strip())
+
+    def _add_music_if_silent(self, video_path: Path, music_item: dict[str, Any]) -> None:
+        """Legt die Musik des Posts unter ein Video, das ohne Tonspur geliefert wurde.
+
+        Die Videospur wird unveraendert kopiert und bestimmt die Laenge: Die Musik
+        wird mit Stille aufgefuellt bzw. am Videoende abgeschnitten. Als Einstieg
+        dient gallery-dls erster ``audio_timestamps``-Wert — der vom Ersteller
+        gewaehlte Ausschnitt selbst steht nicht in den Metadaten, das ist also eine
+        Naeherung. Schlaegt etwas fehl, bleibt das stumme Video unveraendert.
+        """
+        import subprocess
+        import urllib.request
+
+        audio_url = music_item.get("audio_url")
+        if not audio_url or self._has_audio_stream(video_path):
+            return
+
+        timestamps = music_item.get("audio_timestamps") or [0]
+        try:
+            start_seconds = max(0.0, float(timestamps[0]) / 1000)
+        except (TypeError, ValueError):
+            start_seconds = 0.0
+
+        audio_path = video_path.with_name(f"{video_path.stem}.music")
+        muxed_path = video_path.with_name(f"{video_path.stem}.muxed.mp4")
+        try:
+            req = urllib.request.Request(audio_url, headers={"User-Agent": _BROWSER_USER_AGENT})
+            with urllib.request.urlopen(req, timeout=30) as response:
+                audio_path.write_bytes(response.read())
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-v", "error",
+                    "-i", str(video_path),
+                    "-ss", f"{start_seconds:.3f}", "-i", str(audio_path),
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", "copy", "-c:a", "aac", "-af", "apad", "-shortest",
+                    "-movflags", "+faststart",
+                    str(muxed_path),
+                ],
+                capture_output=True, text=True, check=True, timeout=300,
+            )
+            muxed_path.replace(video_path)
+            LOGGER.info(
+                "Stummes Instagram-Video %s mit Musikspur unterlegt (ab %.1f s)",
+                video_path.name,
+                start_seconds,
+            )
+        except Exception as exc:
+            detail = getattr(exc, "stderr", None) or exc
+            LOGGER.warning(
+                "Musikspur fuer %s konnte nicht unterlegt werden: %s", video_path.name, detail
+            )
+        finally:
+            audio_path.unlink(missing_ok=True)
+            muxed_path.unlink(missing_ok=True)
+
+    def _download_single_gallery_item(self, selected_item: dict[str, Any], url: str, tmp_dir: str, music_item: dict[str, Any] | None = None) -> DownloadedVideo | DownloadedImage:
         import urllib.request
         import urllib.parse
         import uuid
@@ -670,6 +765,11 @@ class VideoDownloader:
         
         tmp_path = Path(tmp_dir) / f"{filename}{ext}"
         tmp_path.write_bytes(file_data)
+
+        if is_video and music_item:
+            self._add_music_if_silent(tmp_path, music_item)
+            if tmp_path.stat().st_size > self.max_download_size_bytes:
+                raise DownloaderError("Die Mediendatei überschreitet die erlaubte Telegram-Größe")
         
         persistent_path = self.download_dir / tmp_path.name
         if persistent_path.exists():
@@ -717,7 +817,10 @@ class VideoDownloader:
             cmd.extend(["--username", username])
         if password:
             cmd.extend(["--password", password])
-        cmd.extend(["-j", url])
+        # Instagram liefert Videos mit lizenzierter Musik (v.a. in Karussells)
+        # ohne Tonspur aus; die Musik haengt als eigener Track am Post. Den gibt
+        # gallery-dl nur mit dieser Option aus.
+        cmd.extend(["-o", "audio=merged", "-j", url])
         
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -732,6 +835,7 @@ class VideoDownloader:
                 if code == 3 and isinstance(metadata_dict, dict):
                     media_items.append(metadata_dict)
                     
+        media_items, music_item = split_music_item(media_items)
         if not media_items:
             raise DownloaderError("Keine Medieninhalte in diesem Beitrag gefunden")
             
@@ -755,14 +859,14 @@ class VideoDownloader:
                 selected_item = media_items[0]
                 
             with tempfile.TemporaryDirectory(dir=self.download_dir) as tmp_dir:
-                return self._download_single_gallery_item(selected_item, url, tmp_dir)
+                return self._download_single_gallery_item(selected_item, url, tmp_dir, music_item)
         else:
             # Download all items sequentially (up to 10 for Telegram media group rules)
             downloaded_items = []
             with tempfile.TemporaryDirectory(dir=self.download_dir) as tmp_dir:
                 for item in media_items[:10]:
                     try:
-                        downloaded = self._download_single_gallery_item(item, url, tmp_dir)
+                        downloaded = self._download_single_gallery_item(item, url, tmp_dir, music_item)
                         downloaded_items.append(downloaded)
                     except Exception:
                         pass
