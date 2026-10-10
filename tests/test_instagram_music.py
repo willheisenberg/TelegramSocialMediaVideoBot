@@ -4,7 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from app.downloader import DownloaderError, VideoDownloader, split_music_item
+from app.downloader import (
+    DownloaderError,
+    VideoDownloader,
+    _ValidatingRedirectHandler,
+    _validate_music_url,
+    split_music_item,
+)
 
 pytestmark = pytest.mark.skipif(
     not (shutil.which("ffmpeg") and shutil.which("ffprobe")),
@@ -135,6 +141,42 @@ def test_music_track_is_only_fetched_via_https(downloader, silent_video, tmp_pat
     # Ueber den oeffentlichen Weg bleibt das Video dann einfach stumm.
     downloader._add_music_if_silent(silent_video, {"audio_url": url})
     assert _streams(silent_video) == ["video"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://scontent-ber1-1.cdninstagram.com/o1/v/a.mp4?x=1",
+        "https://scontent-ber1-1.xx.fbcdn.net/o1/v/a.mp4",
+    ],
+)
+def test_instagram_cdn_urls_are_accepted(url):
+    _validate_music_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://192.168.178.1/a.mp4",
+        "https://localhost/a.mp4",
+        "https://evil.example/a.mp4",
+        "https://cdninstagram.com.evil.example/a.mp4",
+        "https://evilfbcdn.net/a.mp4",
+        "http://scontent.cdninstagram.com/a.mp4",
+    ],
+)
+def test_foreign_hosts_are_rejected(downloader, tmp_path, url):
+    with pytest.raises(DownloaderError):
+        downloader._download_music_track(url, tmp_path / "out")
+
+
+@pytest.mark.parametrize("target", ["http://192.168.178.1/", "file:///etc/passwd", "https://evil.example/"])
+def test_redirects_to_foreign_targets_are_rejected(target):
+    import urllib.request
+
+    req = urllib.request.Request("https://scontent.cdninstagram.com/a.mp4")
+    with pytest.raises(DownloaderError):
+        _ValidatingRedirectHandler().redirect_request(req, None, 302, "Found", {}, target)
 
 
 def test_non_mp4_music_file_is_rejected(downloader, silent_video, tmp_path, monkeypatch):

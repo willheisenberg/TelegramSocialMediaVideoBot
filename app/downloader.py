@@ -6,6 +6,8 @@ import logging
 import os
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -149,6 +151,27 @@ _BROWSER_USER_AGENT = (
 # MP4-Demuxer und nur lokale Dateien, damit fremde Inhalte weder exotische
 # Demuxer noch Netzwerk-/Verkettungsprotokolle ausloesen koennen.
 _FFMPEG_LOCAL_MP4_INPUT = ("-protocol_whitelist", "file", "-f", "mov")
+
+
+# Hosts, von denen Instagram Medien ausliefert. Die Musikspur-URL stammt aus den
+# Post-Metadaten; ohne Host-Pruefung liesse sich der Bot damit auf beliebige
+# (auch interne) Adressen lenken.
+_MUSIC_HOST_SUFFIXES = (".cdninstagram.com", ".fbcdn.net")
+
+
+def _validate_music_url(url: str) -> None:
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host.endswith(_MUSIC_HOST_SUFFIXES):
+        raise DownloaderError("Musikspur-URL ist keine https-URL eines Instagram-CDN")
+
+
+class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prueft auch Weiterleitungsziele, sonst waere die URL-Pruefung umgehbar."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_music_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def split_music_item(
@@ -299,7 +322,7 @@ class VideoDownloader:
                     elif "image/webp" in content_type:
                         ext = ".webp"
 
-                    data = response.read()
+                    data = response.read(self.max_download_size_bytes + 1)
             except Exception as exc:
                 raise DownloaderError(f"Download der Bilddatei fehlgeschlagen: {exc}") from exc
 
@@ -658,19 +681,14 @@ class VideoDownloader:
         return bool(res.stdout.strip())
 
     def _download_music_track(self, audio_url: str, dest: Path) -> None:
-        """Laedt die Musikspur nach ``dest`` — nur per https und groessenbegrenzt.
-
-        Die URL stammt aus den Post-Metadaten; ohne Schema-Pruefung wuerde urllib
-        auch ``file://`` oder ``ftp://`` oeffnen.
+        """Laedt die Musikspur nach ``dest`` — nur per https von Instagrams CDN
+        (auch nach Weiterleitungen) und groessenbegrenzt.
         """
-        import urllib.parse
-        import urllib.request
+        _validate_music_url(audio_url)
 
-        if urllib.parse.urlparse(audio_url).scheme != "https":
-            raise DownloaderError("Musikspur-URL ist keine https-URL")
-
+        opener = urllib.request.build_opener(_ValidatingRedirectHandler)
         req = urllib.request.Request(audio_url, headers={"User-Agent": _BROWSER_USER_AGENT})
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with opener.open(req, timeout=30) as response:
             data = response.read(self.max_download_size_bytes + 1)
         if len(data) > self.max_download_size_bytes:
             raise DownloaderError("Musikspur ist zu gross")
@@ -775,7 +793,7 @@ class VideoDownloader:
                 elif "video/mp4" in content_type:
                     ext = ".mp4"
                     
-                file_data = response.read()
+                file_data = response.read(self.max_download_size_bytes + 1)
         except Exception as exc:
             raise DownloaderError(f"Download fehlgeschlagen: {exc}") from exc
             
